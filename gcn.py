@@ -1,10 +1,13 @@
 #!/usr/bin/env python
 
+print 'stdlib imports'
 import os
 import sys
-import numpy as np
 import glob 
 import math
+
+print 'numpy etc'
+import numpy as np
 from matplotlib import pyplot as plt
 from sklearn.metrics import roc_curve,auc,\
             average_precision_score,\
@@ -12,12 +15,12 @@ from sklearn.metrics import roc_curve,auc,\
 from tqdm import tqdm , trange
 import scipy.sparse as sp
 
+print 'torch...'
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.optim.lr_scheduler import MultiStepLR
-from torch_geometric.nn import global_sort_pool
+print '...done'
 
 np.set_printoptions(threshold=np.inf)
 
@@ -119,12 +122,15 @@ class Dataset(object):
 class GraphConv(nn.Module):
     def __init__(self, n_in, n_out, activ=torch.relu):
         super(GraphConv, self).__init__()
-        assert n_out == n_in # changed my mind
         self.kernel = nn.Parameter(torch.Tensor(n_in, n_out))
         self.bias = nn.Parameter(torch.Tensor(n_out))
-        nn.init.xavier_normal_(self.kernel)
-        nn.init.xavier_normal_(self.bias)
         self.activ = activ
+        self.reset_parameters()
+    def reset_parameters(self):
+        stdv = 1. / math.sqrt(self.kernel.size(1))
+        self.kernel.data.uniform_(-stdv, stdv)
+        if self.bias is not None:
+            self.bias.data.uniform_(-stdv, stdv)
     def forward(self, x, Atilde):
         h = torch.mm(x, self.kernel)
         h = torch.mm(Atilde, h)
@@ -142,8 +148,6 @@ class GCN(nn.Module):
             self.convs.append(GraphConv(i, o, torch.relu))
         self.convs.append(GraphConv(latent[-1], n_out, 
                                     lambda h : torch.log_softmax(h, axis=1)))
-        self.gc1 = GraphConvolution(nfeat, nhid)
-        self.gc2 = GraphConvolution(nhid, nclass)
 
     def forward(self, x, Atilde):
         h = x
@@ -154,12 +158,15 @@ class GCN(nn.Module):
 
 if __name__ == '__main__':
 
+    print 'data'
     st = Standardizer()
     data = Dataset(PATH, st)
     gen = data.gen(refresh=True)
 
-    model = GCN().to(DEVICE)
+    print 'model'
+    model = GCN(NFEATS, NSCATTER).to(DEVICE)
 
+    print 'train'
     opt = optim.Adam(model.parameters())
     for epoch in trange(NEPOCH):
         model.train()
