@@ -15,13 +15,13 @@ root.PyConfig.IgnoreCommandLineOptions = True
 from tqdm import tqdm, trange
 import numpy as np
 import scipy.linalg
-import h5py
+import scipy.sparse
 import sys 
 
 
 MAXPARTICLES = 1000
 NEUTRALS = set([22, 2112])
-FILESIZE = 1e4
+FILESIZE = 5e3
 IFILE = 0
 NGRID = 500
 MINDR = 0.025
@@ -60,8 +60,8 @@ class Record(object):
         return lines
 
 class Particle(object):
-    __slots__ = ['y', 'eta', 'phi', 'pt', 'm', 'pdgid']
-    def __init__(self, line=None, vidx=None, eta=None, phi=None, pt=None, pdgid=None):
+    __slots__ = ['y', 'eta', 'phi', 'pt', 'm', 'pdgid', 'q']
+    def __init__(self, line=None, vidx=None, eta=None, phi=None, pt=None, pdgid=None, q=None):
         self.y = vidx
         if line is not None:
             px, py, pz, self.m, self.pdgid = [float(l) for l in line.split()]
@@ -73,9 +73,11 @@ class Particle(object):
             self.eta = eta
             self.phi = phi
             self.pdgid = pdgid
+            self.q = q
     @property
     def x(self):
-        return np.array([self.pt, self.eta, self.phi, self.pdgid]) 
+        vlabel = self.y if self.q else -1 
+        return np.array([self.pt, self.eta, self.phi, self.pdgid, vlabel]) 
 
 class Grid(object):
     def __init__(self, nidx):
@@ -101,7 +103,7 @@ class Grid(object):
             pt = sum(pts)
             px,py,pz = fpxyz(sum(pts), eta, phi)
             vidx = np.argmax(pts)
-            pss[vidx].append(Particle(vidx=vidx, eta=eta, phi=phi, pt=pt, pdgid=0))
+            pss[vidx].append(Particle(vidx=vidx, eta=eta, phi=phi, pt=pt, pdgid=0, q=0))
         return pss 
     def run(self, ps):
         for p in ps:
@@ -118,12 +120,12 @@ class Interaction(object):
             return 
         for _ in xrange(npu):
             for l in rec.get_event():
-                p = Particle(l, vidx)
+                p = Particle(line=l, vidx=vidx)
                 if p.pdgid in NEUTRALS:
-                    p.pdgid = 0
+                    p.q = 0
                     self.neutral.append(p)
                 else:
-                    p.pdgid = 1
+                    p.q = 1
                     self.charged.append(p)
     @property
     def particles(self):
@@ -150,7 +152,7 @@ def get_adj(ep, k):
     invdist = np.minimum(1./MINDR,
                          np.divide(1, dist+MINDR) * MINDR)
     i = np.repeat(np.arange(N).reshape(1,-1), k, axis=0).reshape(-1)
-    adj = np.zeros_like(dr) 
+    adj = np.zeros_like(dr)
     adj[i, nbors] = invdist
     adj[nbors, i] = invdist
     return adj 
@@ -203,6 +205,8 @@ class Event(object):
                     ).reshape(-1)].reshape(self.N, self.N)
         self.adj = self.adj[:MAXPARTICLES,:MAXPARTICLES]
 
+        self.adj = scipy.sparse.coo_matrix(self.adj).tocsr()
+
         if N < MAXPARTICLES:
             pad = MAXPARTICLES - N
             embed = self.x
@@ -217,30 +221,29 @@ class Event(object):
 
 def saveto(xs, ys, adjs, Ns):
     global IFILE
-    outpath = args.output.replace('.h5','_%i.h5'%IFILE)
+    outpath = args.output.replace('.npz','_%i.npz'%IFILE)
 
     x = np.stack(xs, axis=0)
     y = np.stack(ys, axis=0)
     N = np.stack(Ns, axis=0)
-    adj = np.stack(adjs, axis=0)
+    adj = np.array(adjs)
 
     print 'x', x.shape
     print 'y', y.shape
     print 'adj', adj.shape
     print '-->', outpath
+    sys.stdout.flush()
 
     if MAXPARTICLES < 150:
         np.set_printoptions(threshold=np.inf)
         print adj[0]
         print np.concatenate([x[0], y[0][:,np.newaxis]], axis=-1)
 
-    f = h5py.File(outpath, 'w')
-    f.create_dataset('x',   data=x,   compression='gzip', chunks=True)
-    f.create_dataset('N',   data=N,   compression='gzip', chunks=True)
-    f.create_dataset('y',   data=y,   compression='gzip', chunks=True)
-    f.create_dataset('adj', data=adj, compression='gzip', chunks=True)
-
-    f.close()
+    np.savez(outpath,
+             x=x,
+             N=N,
+             y=y,
+             adj=adj)
 
     IFILE += 1
 
