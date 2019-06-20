@@ -19,9 +19,9 @@ import scipy.sparse
 import sys 
 
 
-MAXPARTICLES = 1000
+MAXPARTICLES = 2000
 NEUTRALS = set([22, 2112])
-FILESIZE = 5e3
+FILESIZE = 1e3
 IFILE = 0
 NGRID = 500
 MINDR = 0.025
@@ -146,7 +146,7 @@ def get_adj(ep, k):
     N = ep.shape[0]
     de = np.square((e - e.T))
     dp = np.square(np.arcsin(np.sin((p - p.T))))
-    dr = de + dp 
+    dr = np.sqrt(de + dp) 
     nbors = np.argpartition(dr, np.arange(k), axis=0)[:k].reshape(-1)
     dist = np.sqrt(np.partition(dr, np.arange(k), axis=0)[:k]).reshape(-1)
     invdist = np.minimum(1./MINDR,
@@ -186,7 +186,7 @@ class Event(object):
         y_list = [i.y for i in ints]
         self.y = np.concatenate(y_list, axis=0)
 
-        self.adj = get_adj(self.x[:,1:3], k=5)
+        self.adj = get_adj(self.x[:,1:3], k=8)
 
         # now sort everything
 
@@ -205,8 +205,6 @@ class Event(object):
                     ).reshape(-1)].reshape(self.N, self.N)
         self.adj = self.adj[:MAXPARTICLES,:MAXPARTICLES]
 
-        self.adj = scipy.sparse.coo_matrix(self.adj).tocsr()
-
         if N < MAXPARTICLES:
             pad = MAXPARTICLES - N
             embed = self.x
@@ -218,6 +216,8 @@ class Event(object):
             self.y[:N] = embed 
 
             self.adj = np.pad(self.adj, pad_width=(0, pad), mode='constant', constant_values=0)
+
+        self.adj = scipy.sparse.coo_matrix(self.adj).tocsr()
 
 def saveto(xs, ys, adjs, Ns):
     global IFILE

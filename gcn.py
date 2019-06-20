@@ -1,36 +1,36 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2
+from __future__ import print_function 
 
-print 'stdlib imports'
 import os
 import sys
 import glob 
 import math
 
-print 'numpy etc'
 import numpy as np
-from matplotlib import pyplot as plt
-from sklearn.metrics import roc_curve,auc,\
-            average_precision_score,\
-            roc_auc_score,accuracy_score
+# from matplotlib import pyplot as plt
+# from sklearn.metrics import roc_curve,auc,\
+#             average_precision_score,\
+#             roc_auc_score,accuracy_score
 from tqdm import tqdm , trange
 import scipy.sparse as sp
 
-print 'torch...'
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-print '...done'
+import torchviz
 
 np.set_printoptions(threshold=np.inf)
 
-NNODES = 1000
+NNODES = 2000
 NFEATS = 5
-NSCATTER = 1+1
 DEVICE = 'cuda'
 NEPOCH = 50
 NBATCH = 100
-PATH = '/local/snarayan/grapple_0/*npz'
+HIDW = NFEATS 
+HIDD = 1
+#PATH = '/local/snarayan/noneut_0/*npz'
+PATH = '/local/snarayan/grapple_1/*npz'
 
 
 def t2n(x):
@@ -72,6 +72,44 @@ class Standardizer(object):
             self._sigmainv = np.divide(1, x.std(axis=0))
         return  (x - self._mu) * self._sigmainv 
 
+class FakeDataset(object):
+    def __init__(self, st=None):
+        self.st = st
+    def gen(self, refresh=False):
+        while True:
+            xs, ys, As = [], [], []
+            N = 0
+            while N < NNODES:
+                n = min(NNODES-N, np.random.randint(1, 5))
+                N += n
+                x = np.ones((n,1))
+                y = np.ones(n) * len(ys)
+                A = np.random.binomial(n=1, p=0.25, size=(n*n)).reshape(n,n).astype(bool)
+                A += A.T 
+                A += np.eye(n).astype(bool)
+                A = A.astype(float)
+                As.append(A); xs.append(x); ys.append(y)
+            x = np.concatenate(xs).astype(np.float32)
+            y = np.concatenate(ys).astype(np.int64)
+            A = scipy.linalg.block_diag(*As)
+            A = sp.coo_matrix(A).tocsr()
+
+            D = np.array(A.sum(1))
+            D = np.power(D,-1).flatten()
+            D[np.isinf(D)] = 0
+            D = np.sqrt(D)
+            D = sp.diags(D)
+            Atilde = D.dot(A).dot(D)
+
+            Atilde = Atilde.tocoo().astype(np.float32)
+            idx = n2t(np.vstack([Atilde.row, Atilde.col]).astype(np.int64))
+            data = n2t(Atilde.data)
+            Atilde = torch.sparse.FloatTensor(
+                    idx, data, torch.Size(Atilde.shape)
+                )
+
+            yield n2t(x.astype(np.float32)), n2t(y.astype(np.int64)), Atilde
+
 class Dataset(object):
     def __init__(self, path, st=None):
         self._path = path 
@@ -81,11 +119,11 @@ class Dataset(object):
         while True:
             np.random.shuffle(self._files)
             for f_ in self._files:
-                d = np.load(f_)
+                d = np.load(f_, allow_pickle=True)
                 As = d['adj']
                 xs = d['x']
                 ys = d['y']
-                
+
                 N = xs.shape[0]
 
                 for i in xrange(N):
@@ -96,6 +134,8 @@ class Dataset(object):
                     if st is not None:
                         x = st(x)
 
+                    y = (y > 0).astype(np.int64)
+
                     D = np.array(A.sum(1))
                     D = np.power(D,-1).flatten()
                     D[np.isinf(D)] = 0
@@ -103,76 +143,103 @@ class Dataset(object):
                     D = sp.diags(D)
                     Atilde = D.dot(A).dot(D)
 
+                    Atilde = n2t(Atilde.toarray().astype(np.float32))
+                    '''
                     Atilde = Atilde.tocoo().astype(np.float32)
                     idx = n2t(np.vstack([Atilde.row, Atilde.col]).astype(np.int64))
                     data = n2t(Atilde.data)
                     Atilde = torch.sparse.FloatTensor(
                             idx, data, torch.Size(Atilde.shape)
                         )
+                    '''
 
-                    yield n2t(x), n2t(y), Atilde
+                    yield n2t(x.astype(np.float32)), n2t(y.astype(np.int64)), Atilde
 
             if not refresh:
                 return
-            print 'Exhausted %s, reloading'%self._pattern
-
-# largely inspired by tkipf's pygcn implementation
-# https://github.com/tkipf/pygcn
+            print('Exhausted %s, reloading'%self._path)
 
 class GraphConv(nn.Module):
-    def __init__(self, n_in, n_out, activ=torch.relu):
+    def __init__(self, n_in, n_out, powers=(1,), activ=torch.relu):
         super(GraphConv, self).__init__()
-        self.kernel = nn.Parameter(torch.Tensor(n_in, n_out))
+        self.powers = powers 
+        self.kernels = nn.ParameterList([nn.Parameter(torch.Tensor(n_in, n_out)) for _ in powers])
         self.bias = nn.Parameter(torch.Tensor(n_out))
         self.activ = activ
         self.reset_parameters()
     def reset_parameters(self):
-        stdv = 1. / math.sqrt(self.kernel.size(1))
-        self.kernel.data.uniform_(-stdv, stdv)
+        for k in self.kernels:
+            stdv = 1. / math.sqrt(k.size(1))
+            k.data.uniform_(-stdv, stdv)
+            # nn.init.xavier_normal_(k.data)
         if self.bias is not None:
             self.bias.data.uniform_(-stdv, stdv)
-    def forward(self, x, Atilde):
-        h = torch.mm(x, self.kernel)
-        h = torch.mm(Atilde, h)
-        h = h + self.bias
-        h = self.activ(h)
+    def forward(self, x, adj):
+        support = None 
+        for p,k in zip(self.powers, self.kernels):
+            h = torch.mm(adj.matrix_power(p), x)
+            h = torch.mm(h, k)
+            if support is None:
+                support = h 
+            else:
+                support += h 
+        '''
+        last_adj = None 
+        support = None
+        for j,k in enumerate(self.kernels):
+            if last_adj is not None:
+                last_adj = torch.mm(last_adj, adj)
+                h = torch.mm(last_adj, x)
+            else:
+                last_adj = adj 
+                h = x 
+            h = torch.mm(h, k)
+            if support is None:
+                support = h 
+            else:
+                support += h 
+        h = torch.mm(adj, x)
+        support = torch.mm(h, self.kernels[0])
+        '''
+        h = self.activ(support)
         return h
 
 class GCN(nn.Module):
-    def __init__(self, n_in, n_out, latent=[10, 10]):
+    def __init__(self, n_in=HIDW, powers=(0,1), latent=[HIDW]*(HIDD)):
         super(GCN, self).__init__()
+        self._mods = nn.ModuleList()
         
-        latent = [n_in] + latent
-        self.convs = nn.ModuleList()
-        for i,o in zip(latent[:-1], latent[1:]):
-            self.convs.append(GraphConv(i, o, torch.relu))
-        self.convs.append(GraphConv(latent[-1], n_out, 
-                                    lambda h : torch.log_softmax(h, axis=1)))
+        latent = [n_in] + latent + [2]
+        self.convs = [GraphConv(i, o, powers, torch.relu) for i,o in zip(latent[:-1], latent[1:])]
+        self._mods += self.convs 
 
-    def forward(self, x, Atilde):
+    def print_me(self):
+        return 
+        for i,c in enumerate(self.convs):
+            print(i, [t2n(k).flatten() for k in c.kernels])
+
+    def forward(self, x, adj):
         h = x
         for c in self.convs:
-            h = c(h, Atilde)
-        return h
-
+            h = c(h, adj)
+        return h 
+        logprobs = []
 
 if __name__ == '__main__':
 
-    print 'data'
     st = Standardizer()
     data = Dataset(PATH, st)
+    data = FakeDataset()
     gen = data.gen(refresh=True)
 
-    print 'model'
-    model = GCN(NFEATS, NSCATTER).to(DEVICE)
+    model = GCN().to(DEVICE)
 
-    print 'train'
     opt = optim.Adam(model.parameters())
-    for epoch in trange(NEPOCH):
+    for epoch in range(NEPOCH):
         model.train()
         count = 0
         train_acc = 0.
-        for batch in trange(NBATCH):
+        for batch in range(NBATCH):
             x, y, Atilde = next(gen)
             count += x.shape[0]
             opt.zero_grad()
@@ -186,14 +253,21 @@ if __name__ == '__main__':
             opt.step()
 #            train_acc += (preds == data['labels']).sum().item()
 #            print '='*20
-        preds = np.stack([t2n(l).argmax(axis=1) for l in logprobs], axis=-1)
-        pred = preds[0]
-        mask0 = y == 0
-        mask1 = y !=0
-        print '%i/%i PV, %i/%i PU are correct'%(
-                    np.sum(pred[mask0] == 0), np.sum(mask0),
-                    np.sum(pred[mask1] != 0), np.sum(mask1),
-                )
+        pred = t2n(logprobs).argmax(axis=1)
+        # preds = np.stack([t2n(l).argmax(axis=1) for l in logprobs], axis=-1)
+        ny = t2n(y)
+        mask0 = ny == 0
+        mask1 = ~mask0
+        n = t2n(x[:,-1]) < -0.5 
+        q = ~n
+        print('%i/%i charged PV'%(np.sum(pred[mask0 & q]==0), np.sum(mask0 & q)))
+        print('%i/%i neutral PV'%(np.sum(pred[mask0 & n]==0), np.sum(mask0 & n)))
+        print('%i/%i charged PU'%(np.sum(pred[mask1 & q]==1), np.sum(mask1 & q)))
+        print('%i/%i neutral PU'%(np.sum(pred[mask1 & n]==1), np.sum(mask1 & n)))
+        print(' -- Epoch %i has loss %.6g'%(epoch, loss.item()))
+
+    for yy,qq,ll in zip(ny, q,t2n(logprobs)):
+        print(yy,qq,np.exp(ll))
 
 #        ys = []
 #        yscores = []
@@ -212,4 +286,3 @@ if __name__ == '__main__':
 #        rocauc('nn',ys,yscores)
 #        rocauc('tau32',ys,tau32s)
 #        print 'Epoch %i has loss %.6g and acc %.3f'%(epoch, loss.item()/count, train_acc/count)
-        print 'Epoch %i has loss %.6g'%(epoch, loss.item()/BATCH)
