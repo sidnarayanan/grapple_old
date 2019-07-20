@@ -1,5 +1,3 @@
-#!/usr/bin/env python2
-from __future__ import print_function 
 
 import os
 import sys
@@ -13,22 +11,23 @@ import numpy as np
 #             roc_auc_score,accuracy_score
 from tqdm import tqdm , trange
 import scipy.sparse as sp
+import scipy.linalg
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import torchviz
+#import torchviz
 
 np.set_printoptions(threshold=np.inf)
 
-NNODES = 2000
+NNODES = 200
 NFEATS = 5
-DEVICE = 'cuda'
-NEPOCH = 50
-NBATCH = 100
+DEVICE = 'cpu'
+NEPOCH = 5
+NBATCH = 1000
 HIDW = NFEATS 
-HIDD = 1
+HIDD = 2
 #PATH = '/local/snarayan/noneut_0/*npz'
 PATH = '/local/snarayan/grapple_1/*npz'
 
@@ -79,12 +78,11 @@ class FakeDataset(object):
         while True:
             xs, ys, As = [], [], []
             N = 0
-            while N < NNODES:
-                n = min(NNODES-N, np.random.randint(1, 5))
-                N += n
-                x = np.ones((n,1))
+            partition = np.random.randint(1, NNODES-1)
+            for n in (partition, NNODES-partition):
+                x = np.ones((n,1)) * len(xs)
                 y = np.ones(n) * len(ys)
-                A = np.random.binomial(n=1, p=0.25, size=(n*n)).reshape(n,n).astype(bool)
+                A = np.random.binomial(n=1, p=.3, size=(n*n)).reshape(n,n).astype(bool)
                 A += A.T 
                 A += np.eye(n).astype(bool)
                 A = A.astype(float)
@@ -92,21 +90,26 @@ class FakeDataset(object):
             x = np.concatenate(xs).astype(np.float32)
             y = np.concatenate(ys).astype(np.int64)
             A = scipy.linalg.block_diag(*As)
-            A = sp.coo_matrix(A).tocsr()
+            # A = sp.coo_matrix(A).tocsr()
 
             D = np.array(A.sum(1))
             D = np.power(D,-1).flatten()
             D[np.isinf(D)] = 0
             D = np.sqrt(D)
-            D = sp.diags(D)
+            #D = sp.diags(D)
+            D = np.diag(D)
             Atilde = D.dot(A).dot(D)
+            Atilde = Atilde.astype(np.float32)
 
+            '''
             Atilde = Atilde.tocoo().astype(np.float32)
             idx = n2t(np.vstack([Atilde.row, Atilde.col]).astype(np.int64))
             data = n2t(Atilde.data)
             Atilde = torch.sparse.FloatTensor(
                     idx, data, torch.Size(Atilde.shape)
                 )
+            '''
+            Atilde = n2t(Atilde)
 
             yield n2t(x.astype(np.float32)), n2t(y.astype(np.int64)), Atilde
 
@@ -207,16 +210,18 @@ class GraphConv(nn.Module):
 class GCN(nn.Module):
     def __init__(self, n_in=HIDW, powers=(0,1), latent=[HIDW]*(HIDD)):
         super(GCN, self).__init__()
-        self._mods = nn.ModuleList()
         
-        latent = [n_in] + latent + [2]
-        self.convs = [GraphConv(i, o, powers, torch.relu) for i,o in zip(latent[:-1], latent[1:])]
-        self._mods += self.convs 
+        latent = [n_in] + latent 
+        self.convs = nn.ModuleList(
+                [GraphConv(i, o, powers, torch.relu) for i,o in zip(latent[:-1], latent[1:])]
+            )
+        self.convs.append(GraphConv(latent[-1], 2, powers, 
+                                    lambda h : torch.log_softmax(h, dim=1)))
 
     def print_me(self):
         return 
         for i,c in enumerate(self.convs):
-            print(i, [t2n(k).flatten() for k in c.kernels])
+            print(i, [t2n(k) for k in c.kernels])
 
     def forward(self, x, adj):
         h = x
@@ -225,21 +230,27 @@ class GCN(nn.Module):
         return h 
         logprobs = []
 
+
+#trange = lambda x, **kwargs : range(x)
+
 if __name__ == '__main__':
 
     st = Standardizer()
-    data = Dataset(PATH, st)
+    #data = Dataset(PATH, st)
+    print('data...')
     data = FakeDataset()
     gen = data.gen(refresh=True)
 
-    model = GCN().to(DEVICE)
+    print('model...')
+    model = GCN(n_in=1).to(DEVICE)
 
     opt = optim.Adam(model.parameters())
-    for epoch in range(NEPOCH):
+    for epoch in trange(NEPOCH):
         model.train()
         count = 0
         train_acc = 0.
-        for batch in range(NBATCH):
+        model.print_me()
+        for batch in trange(NBATCH, leave=False):
             x, y, Atilde = next(gen)
             count += x.shape[0]
             opt.zero_grad()
@@ -248,7 +259,7 @@ if __name__ == '__main__':
 #                print t2n(l)
             # print t2n(logprobs)[:10]
             loss = F.nll_loss(logprobs, y)
-            # loss = sum([F.nll_loss(logprobs[i], ys[i]) for i in xrange(NNODES)])
+            #loss = sum([F.nll_loss(logprobs[i], y[i]) for i in xrange(NNODES)])
             loss.backward()
             opt.step()
 #            train_acc += (preds == data['labels']).sum().item()
@@ -256,18 +267,16 @@ if __name__ == '__main__':
         pred = t2n(logprobs).argmax(axis=1)
         # preds = np.stack([t2n(l).argmax(axis=1) for l in logprobs], axis=-1)
         ny = t2n(y)
+        nx = t2n(x)
         mask0 = ny == 0
         mask1 = ~mask0
-        n = t2n(x[:,-1]) < -0.5 
-        q = ~n
-        print('%i/%i charged PV'%(np.sum(pred[mask0 & q]==0), np.sum(mask0 & q)))
-        print('%i/%i neutral PV'%(np.sum(pred[mask0 & n]==0), np.sum(mask0 & n)))
-        print('%i/%i charged PU'%(np.sum(pred[mask1 & q]==1), np.sum(mask1 & q)))
-        print('%i/%i neutral PU'%(np.sum(pred[mask1 & n]==1), np.sum(mask1 & n)))
+        print('%i/%i charged PV'%(np.sum(pred[mask0]==0), np.sum(mask0)))
+        print('%i/%i charged PU'%(np.sum(pred[mask1]==1), np.sum(mask1)))
         print(' -- Epoch %i has loss %.6g'%(epoch, loss.item()))
 
-    for yy,qq,ll in zip(ny, q,t2n(logprobs)):
-        print(yy,qq,np.exp(ll))
+    for xx,yy,ll in zip(nx, ny, t2n(logprobs)):
+        break 
+        print(xx,yy,np.exp(ll))
 
 #        ys = []
 #        yscores = []
