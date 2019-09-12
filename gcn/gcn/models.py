@@ -26,6 +26,7 @@ class Model(object):
 
         self.inputs = None
         self.outputs = None
+        self.outputs_softmax = None 
 
         self.loss = 0
         self.accuracy = 0
@@ -149,6 +150,7 @@ class GCN(Model):
             self.loss += FLAGS.weight_decay * tf.nn.l2_loss(var)
 
         # Cross entropy error
+        self.outputs_softmax = tf.nn.softmax(self.outputs)  
         self.loss += masked_softmax_cross_entropy(self.outputs, self.placeholders['labels'],
                                                   self.placeholders['labels_mask'])
 
@@ -165,6 +167,15 @@ class GCN(Model):
                                             dropout=True,
                                             sparse_inputs=True,
                                             logging=self.logging))
+
+
+        for _ in range(3):
+            self.layers.append(GraphConvolution(input_dim=FLAGS.hidden1,
+                                                output_dim=FLAGS.hidden1,
+                                                placeholders=self.placeholders,
+                                                act=tf.nn.relu,
+                                                dropout=True,
+                                                logging=self.logging))
 
         self.layers.append(GraphConvolution(input_dim=FLAGS.hidden1,
                                             output_dim=self.output_dim,
